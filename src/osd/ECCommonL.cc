@@ -708,18 +708,25 @@ void ECCommonL::ReadPipeline::objects_read_and_reconstruct(
   map<hobject_t, read_request_t> for_read_op;
   for (auto &&to_read: reads) {
     set<int> want_to_read;
-    // Special-case: if this pool/profile is using SizeCeph, we must read all k+m shards 
-    // because the SizeCeph plugin requires all physical chunks to decode.
+    // Special-case: if this pool/profile is using SizeCeph or SizeCeph_Actual, we must read all k+m shards 
+    // because these plugins require all physical chunks to decode.
     // This ensures minimum_to_decode() gets all the chunks it needs.
     try {
       const std::string &profile_name = get_parent()->get_pool().erasure_code_profile;
       const auto &profile = get_osdmap()->get_erasure_code_profile(profile_name);
       auto plugin_it = profile.find("plugin");
-      bool is_sizeceph = (plugin_it != profile.end() && plugin_it->second == "sizeceph");
+      bool is_sizeceph = (plugin_it != profile.end() && 
+                         (plugin_it->second == "sizeceph" || plugin_it->second == "sizeceph_actual"));
 
       if (is_sizeceph) {
-        // SizeCeph always needs all shards for decode - let minimum_to_decode handle the logic
-        get_want_to_read_all_shards(&want_to_read);
+        if (plugin_it->second == "sizeceph") {
+          // Original SizeCeph always needs all shards for decode
+          get_want_to_read_all_shards(&want_to_read);
+        } else {
+          // SizeCeph_Actual has intelligent minimum_to_decode logic (minimum 6 OSDs)
+          // Let the plugin's minimum_to_decode determine optimal read strategy
+          get_want_to_read_shards(&want_to_read);
+        }
       } else if (cct->_conf->bluestore_debug_inject_read_err &&
                  ECInject::test_parity_read(to_read.first)) {
         get_want_to_read_all_shards(&want_to_read);
