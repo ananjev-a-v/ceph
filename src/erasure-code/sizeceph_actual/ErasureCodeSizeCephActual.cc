@@ -352,71 +352,88 @@ int ErasureCodeSizeCephActual::encode(const shard_id_set &want_to_encode,
   }
   
   // Validate all 9 chunks are requested (SizeCeph_Actual requires all chunks for algorithm)
-  if (want_to_encode.size() != SIZECEPH_ACTUAL_N) {
-    dout(0) << "SizeCeph_Actual encode: need all " << SIZECEPH_ACTUAL_N 
-            << " chunks, got " << want_to_encode.size() << dendl;
+  if (want_to_encode.size() > SIZECEPH_ACTUAL_M) {
+    dout(0) << "SizeCeph_Actual encode: requested more than " << SIZECEPH_ACTUAL_M
+            << " chunks: " << want_to_encode.size() << dendl;
     return -EINVAL;
   }
+
+  // Handle empty input or output
+  if (in.length() == 0 || want_to_encode.empty()) {
+    return 0;
+  }
   
-  // Validate chunk IDs are 0-8
+  // Validate chunk IDs are 4-8
   for (const auto& shard : want_to_encode) {
-    if (shard.id < 0 || shard.id >= (int)SIZECEPH_ACTUAL_N) {
-      dout(0) << "SizeCeph_Actual encode: invalid shard id " << shard.id << dendl;
+    if (shard.id < (int)SIZECEPH_ACTUAL_K || shard.id >= (int)SIZECEPH_ACTUAL_N) {
+      dout(0) << "SizeCeph_Actual encode: invalid output shard id " << shard.id << dendl;
       return -EINVAL;
     }
   }
-  
-  // Handle empty input
-  if (in.length() == 0) {
-    for (const auto& shard : want_to_encode) {
-      (*encoded)[shard] = ceph::bufferlist();
-    }
-    return 0;
-  }
 
-  // Validate input alignment using get_alignment() method
-  unsigned int required_alignment = get_alignment();
-  if (in.length() % required_alignment != 0) {
-    dout(0) << "SizeCeph_Actual encode: input size " << in.length() 
-            << " not divisible by " << required_alignment 
-            << " (required by SizeCeph_Actual algorithm via get_alignment())" << dendl;
-    return -EINVAL;
-  }
+  // Get the chunk_size and validate all chunks are thr same size
+  assert(in.length() % SIZECEPH_ACTUAL_K == 0);
+  const size_t chunk_size = in.length() / SIZECEPH_ACTUAL_K;
 
   // ================================================================================
   // ENCODE PROCESSING - Use get_chunk_size() for proper size calculation
   // ================================================================================
-  
-  // Calculate expected chunk size using get_chunk_size() method
-  unsigned int input_length = in.length();
-  unsigned int chunk_size = get_chunk_size(input_length);
-  
+
+  // Define buffers
+  const unsigned char* input_ptrs[SIZECEPH_ACTUAL_K];
+  unsigned char* output_ptrs[SIZECEPH_ACTUAL_M];
+  ceph::bufferlist input_temp; // Input buffers for the case if 'in' segmants are not chunks
+  shard_id_map<ceph::bufferptr> encoded_temp(SIZECEPH_ACTUAL_M); // Output buffers for unwanted shards
+
+  // Initialize input buffers
+  bool segments_from_buffers = true;
+  if (in.get_num_buffers() == SIZECEPH_ACTUAL_K) {
+	  unsigned int segment_nr = 0;
+	  for (auto &seg : in.buffers()) {
+	      const size_t len = seg.length();
+	      if (segment_nr >= SIZECEPH_ACTUAL_K || len != chunk_size) {
+	    	  segments_from_buffers = false;
+	    	  break;
+	      }
+
+	      input_ptrs[segment_nr++] = reinterpret_cast<const unsigned char*>(seg.c_str());
+	  }
+
+	  if (segment_nr < SIZECEPH_ACTUAL_K) {
+		  segments_from_buffers = false;
+	  }
+  }
+  else {
+	  segments_from_buffers = false;
+  }
+
+  if (!segments_from_buffers) {
+	  // We cannot do zero-copy; make contiguous copy for each chunk
+	  ceph::bufferlist::const_iterator it_chunk_start = in.begin();
+	  for (unsigned int shard_id = 0; shard_id < SIZECEPH_ACTUAL_K; ++shard_id) {
+		  ceph::bufferptr input_chunk = ceph::buffer::create(chunk_size);
+		  it_chunk_start.copy_deep(chunk_size, input_chunk);
+		  input_ptrs[shard_id] = reinterpret_cast<const unsigned char*>(input_chunk.c_str());
+		  input_temp.append(input_chunk);
+		  it_chunk_start += chunk_size;
+	  }
+  }
+
   // Buffer allocation - OSD provides empty shard_id_map, plugin allocates actual buffers
-  std::vector<unsigned char*> output_ptrs(SIZECEPH_ACTUAL_N);
-  
-  for (const auto& wanted_shard : want_to_encode) {
-    ceph::bufferptr chunk_buffer = ceph::buffer::create(chunk_size);
-    output_ptrs[wanted_shard.id] = (unsigned char*)chunk_buffer.c_str();
-    (*encoded)[wanted_shard].append(chunk_buffer);
-  }
-  
-  // Zero out output buffers for safety
-  for (const auto& wanted_shard : want_to_encode) {
-    memset((*encoded)[wanted_shard].c_str(), 0, chunk_size);
-    // Verify buffer pointer consistency
-    if ((*encoded)[wanted_shard].c_str() != (char*)output_ptrs[wanted_shard.id]) {
-      dout(0) << "SizeCeph_Actual encode: output buffer pointer mismatch for chunk " 
-              << wanted_shard.id << dendl;
-      ceph_assert(false); // This should never happen
-    }
+  for (int i = 0; i < (int)SIZECEPH_ACTUAL_M; ++i) {
+      shard_id_t shard;
+      shard.id = SIZECEPH_ACTUAL_K + i;
+      ceph::bufferptr chunk_buffer = ceph::buffer::create(chunk_size);
+      if (want_to_encode.contains(shard)) {
+    	    (*encoded)[shard].append(chunk_buffer);
+      }
+      else {
+    	  encoded_temp.insert(shard, chunk_buffer);
+      }
+      output_ptrs[i] = reinterpret_cast<unsigned char*>(chunk_buffer.c_str());
   }
 
-  // Execute SizeCeph_Actual encoding directly on Ceph's aligned input
-  // Create contiguous buffer for SizeCeph_Actual (it needs contiguous memory)
-  ceph::bufferptr contiguous_input = ceph::buffer::create(input_length);
-  in.begin().copy(input_length, contiguous_input.c_str());
-
-  sizeceph_split_func(output_ptrs.data(), (unsigned char*)contiguous_input.c_str(), input_length);
+  sizeceph_split_func(output_ptrs, input_ptrs, chunk_size);
 
   return 0;
 }
@@ -449,123 +466,123 @@ int ErasureCodeSizeCephActual::decode(const shard_id_set &want_to_read,
     return -ENOENT;
   }
   
-  // CORRECTED: SizeCeph_Actual requires minimum 6 chunks (not all 9 like original SizeCeph)
+  // SizeCeph_Actual requires minimum 6 chunks (not all 9 like original SizeCeph)
   if (available.size() < SIZECEPH_ACTUAL_MIN_OSDS) {
     dout(0) << "SizeCeph_Actual decode: need at least " << SIZECEPH_ACTUAL_MIN_OSDS 
-            << " chunks, got only " << available.size() 
-            << " (SizeCeph_Actual algorithm requires minimum 6 for safety)" << dendl;
+            << " chunks, got only " << available.size() << dendl;
     return -ENOENT;
   }
   
+  // Validate chunk IDs are 0-3
+  for (const auto& shard : want_to_read) {
+    if (shard.id < 0 || shard.id >= (int)SIZECEPH_ACTUAL_K) {
+      dout(0) << "SizeCeph_Actual decode: invalid output shard id " << shard.id << dendl;
+      return -EINVAL;
+    }
+    assert(!chunks.contains(shard));
+  }
+
   // Determine chunk size
-  unsigned int effective_chunk_size = chunk_size;
-  if (effective_chunk_size <= 0 && !chunks.empty()) {
+  unsigned int effective_chunk_size;
+  if (chunk_size <= 0 && !chunks.empty()) {
     effective_chunk_size = chunks.begin()->second.length();
+  }
+  else {
+	  effective_chunk_size = chunk_size > 0 ? chunk_size : 0;
   }
   if (effective_chunk_size == 0) {
     dout(0) << "SizeCeph_Actual decode: invalid chunk size" << dendl;
     return -EINVAL;
   }
   
+  // Validate chunk size
+  for (auto &&[shard, in] : chunks) {
+	  assert(in.length() >= effective_chunk_size);
+  }
+
   // ================================================================================
   // DECODE PROCESSING
   // ================================================================================
   
-  // Prepare input chunks for SizeCeph_Actual restore
-  std::vector<unsigned char*> input_chunks(SIZECEPH_ACTUAL_N);
-  std::vector<ceph::bufferlist> chunk_copies(SIZECEPH_ACTUAL_N);
-  std::vector<bool> chunk_available(SIZECEPH_ACTUAL_N, false);
-  
-  // Initialize with nullptr for missing chunks
-  for (unsigned int i = 0; i < SIZECEPH_ACTUAL_N; ++i) {
-    input_chunks[i] = nullptr;
+  // Define buffers
+  unsigned char* data_ptrs[SIZECEPH_ACTUAL_N];
+  int use_disk_flags[SIZECEPH_ACTUAL_N];
+  ceph::bufferlist buffers_temp; // Input buffers for the case if 'in' segmants are not contiguous
+
+  /* - from encode()
+  const unsigned char* input_ptrs[SIZECEPH_ACTUAL_K];
+  unsigned char* output_ptrs[SIZECEPH_ACTUAL_M];
+  ceph::bufferlist input_temp; // Input buffers for the case if 'in' segmants are not chunks
+  shard_id_map<ceph::bufferptr> encoded_temp(SIZECEPH_ACTUAL_M); // Output buffers for unwanted shards
+   */
+  //std::vector<unsigned char*> input_chunks(SIZECEPH_ACTUAL_N);
+  //std::vector<ceph::bufferlist> chunk_copies(SIZECEPH_ACTUAL_N);
+  //std::vector<bool> chunk_available(SIZECEPH_ACTUAL_N, false);
+
+  /*
+  // Encode
+  // Buffer allocation - OSD provides empty shard_id_map, plugin allocates actual buffers
+  for (int8_t i = 0; i < (int8_t)SIZECEPH_ACTUAL_M; ++i) {
+      shard_id_t shard;
+      shard.id = SIZECEPH_ACTUAL_K + i;
+      ceph::bufferptr chunk_buffer = ceph::buffer::create(chunk_size);
+      if (want_to_encode.contains(shard)) {
+    	    (*encoded)[shard].append(chunk_buffer);
+      }
+      else {
+    	  encoded_temp.insert(shard, chunk_buffer);
+      }
+      output_ptrs[i] = reinterpret_cast<unsigned char*>(chunk_buffer.c_str());
   }
-  
-  // Load available chunks
-  for (const auto& chunk_pair : chunks) {
-    shard_id_t shard_id = chunk_pair.first;
-    if ((unsigned int)shard_id.id < SIZECEPH_ACTUAL_N) {
-      chunk_copies[shard_id.id].append(chunk_pair.second);
-      input_chunks[shard_id.id] = (unsigned char*)chunk_copies[shard_id.id].c_str();
-      chunk_available[shard_id.id] = true;
-    }
+  */
+  for (int8_t shard_id = 0; shard_id < (int8_t)SIZECEPH_ACTUAL_N; ++shard_id) {
+	  shard_id_t shard;
+	  shard.id = shard_id;
+	  if (chunks.contains(shard)) {
+		  const ceph::bufferlist& chunk_buffer = chunks.at(shard);
+		  if (chunk_buffer.get_num_buffers() == 1) {
+			  data_ptrs[shard_id] = reinterpret_cast<unsigned char*>(const_cast<char*>(chunk_buffer.buffers().front().c_str()));
+		  }
+		  else {
+			  ceph::bufferptr temp_chunk_buffer = ceph::buffer::create(effective_chunk_size);
+			  chunk_buffer.begin().copy_deep(chunk_size, temp_chunk_buffer);
+			  data_ptrs[shard_id] = reinterpret_cast<unsigned char*>(temp_chunk_buffer.c_str());
+			  buffers_temp.append(temp_chunk_buffer);
+		  }
+	  }
+	  else {
+		  data_ptrs[shard_id] = NULL;
+	  }
   }
 
-  // Check restore capability
-  std::vector<const unsigned char*> const_input_chunks(SIZECEPH_ACTUAL_N);
-  for (unsigned int i = 0; i < SIZECEPH_ACTUAL_N; ++i) {
-    const_input_chunks[i] = input_chunks[i];
-  }
-  
-  if (!sizeceph_can_get_restore_func(const_input_chunks.data())) {
+  if (!sizeceph_can_get_restore_func(const_cast<const unsigned char**>(data_ptrs), use_disk_flags)) {
     dout(0) << "SizeCeph_Actual decode: algorithm reports restore not possible" << dendl;
     return -ENOTSUP;
   }
+
+  // Allocate output buffers
+  for (int id = 0; id < (int)SIZECEPH_ACTUAL_K; ++id) {
+	  shard_id_t shard;
+	  shard.id = id;
+	  if (want_to_read.contains(shard)) {
+		  assert(data_ptrs[id] == NULL);
+	      ceph::bufferptr chunk_buffer = ceph::buffer::create(effective_chunk_size);
+	      (*decoded)[shard].append(chunk_buffer);
+		  data_ptrs[id] = reinterpret_cast<unsigned char*>(chunk_buffer.c_str());
+	  }
+	  else {
+	      ceph::bufferptr chunk_buffer = ceph::buffer::create(effective_chunk_size);
+	      buffers_temp.append(chunk_buffer);
+		  data_ptrs[id] = reinterpret_cast<unsigned char*>(chunk_buffer.c_str());
+	  }
+  }
   
   // Execute restore - sizeceph_restore reconstructs the ORIGINAL data that was encoded
-  // Calculate original data size: reverse of get_chunk_size() calculation
-  // get_chunk_size() does: round_up_to(stripe_width, k_alignment) / K = effective_chunk_size
-  // So: round_up_to(original_data_size, k_alignment) = effective_chunk_size * K
-  // Therefore: original_data_size = effective_chunk_size * K (since it was already aligned during encode)
-  unsigned int original_data_size = effective_chunk_size * SIZECEPH_ACTUAL_K;
-  ceph::bufferptr restored_data = ceph::buffer::create(original_data_size);
-  unsigned char* output_ptr = (unsigned char*)restored_data.c_str();
   
-  int restore_result = sizeceph_restore_func(output_ptr, const_input_chunks.data(), original_data_size);
+  int restore_result = sizeceph_restore_func(data_ptrs, use_disk_flags, effective_chunk_size);
   if (restore_result != 0) {
     dout(0) << "SizeCeph_Actual decode: restore failed with error " << restore_result << dendl;
     return -EIO;
-  }
-
-  // Handle chunk requests
-  for (const auto& wanted_shard : want_to_read) {
-    shard_id_t shard_id = wanted_shard;
-    
-    if ((unsigned int)shard_id.id >= SIZECEPH_ACTUAL_N) {
-      dout(0) << "SizeCeph_Actual decode: invalid shard id " << shard_id.id << dendl;
-      return -EINVAL;
-    }
-    
-    // CRITICAL UNDERSTANDING: Use the restored original data to generate requested chunks
-    // - SizeCeph_Actual decodes to restore the ORIGINAL data that was encoded
-    // - For data chunks (0-3): simulate by dividing restored data into K parts
-    // - For parity chunks (4-8): re-encode the restored data to get the specific chunk
-    
-    ceph::bufferlist chunk_bl;
-    
-    if ((unsigned int)shard_id.id < SIZECEPH_ACTUAL_K) {
-      // Data chunks (0-3): Extract from restored original data
-      // CRITICAL: Each chunk must be exactly chunk_size bytes as expected by Ceph
-      ceph::bufferlist original_data_bl;
-      original_data_bl.append(restored_data);
-      
-      // Calculate the portion of original data for this "data chunk"
-      // Use get_chunk_size() for consistency with encoding logic
-      unsigned int original_data_per_chunk = get_chunk_size(original_data_size);
-      unsigned int start_offset = shard_id.id * original_data_per_chunk;
-      unsigned int length = (shard_id.id == SIZECEPH_ACTUAL_K - 1) ? 
-                             (original_data_size - start_offset) : original_data_per_chunk;
-      
-      // Extract the data portion
-      ceph::bufferlist data_portion;
-      data_portion.substr_of(original_data_bl, start_offset, length);
-      
-      chunk_bl = std::move(data_portion);
-      dout(15) << "SizeCeph_Actual decode: returning data chunk " << shard_id.id 
-               << " length=" << chunk_bl.length() << " expected=" << chunk_size << dendl;
-    } else {
-      // Parity chunks (4-8): Cannot be returned directly by SizeCeph_Actual
-      // SizeCeph_Actual transforms all chunks, so parity chunks cannot be reconstructed
-      // independently. Let Ceph's automatic encode fallback handle these missing chunks.
-      // 
-      // By NOT adding this chunk to (*decoded), we signal to Ceph's ECUtil.cc that
-      // it needs to use the encode fallback mechanism (lines 695-696 in ECUtil.cc)
-      dout(15) << "SizeCeph_Actual decode: parity chunk " << shard_id.id 
-               << " requires encode fallback - not returned by decode (letting Ceph handle via encode)" << dendl;
-      continue; // Skip adding this chunk to decoded map - triggers Ceph's encode fallback
-    }
-    
-    (*decoded)[shard_id] = chunk_bl;
   }
   
   return 0;

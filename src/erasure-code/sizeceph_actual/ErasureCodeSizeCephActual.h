@@ -121,9 +121,9 @@ private:
   static std::mutex library_mutex;
   
   // Function pointers for sizeceph_actual library
-  typedef void (*sizeceph_split_fn_t)(unsigned char **pp_dst, unsigned char *p_src, unsigned int len);
-  typedef int (*sizeceph_restore_fn_t)(unsigned char *p_dst, const unsigned char **pp_src, unsigned int len);
-  typedef int (*sizeceph_can_get_restore_fn_t)(const unsigned char **pp_src);
+  typedef void (*sizeceph_split_fn_t)(unsigned char **pp_parity, const unsigned char **pp_data, unsigned int len);
+  typedef int (*sizeceph_restore_fn_t)(unsigned char **pp_data, const int use_disk_flags[SIZECEPH_ACTUAL_N], unsigned int len);
+  typedef int (*sizeceph_can_get_restore_fn_t)(const unsigned char **pp_data, /* output */ int use_disk_flags[SIZECEPH_ACTUAL_N]);
   
   static sizeceph_split_fn_t sizeceph_split_func;
   static sizeceph_restore_fn_t sizeceph_restore_func;
