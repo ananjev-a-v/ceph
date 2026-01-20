@@ -119,6 +119,7 @@ int ErasureCodeSizeCephActual::init(ceph::ErasureCodeProfile &_profile, std::ost
   // Load the SizeCeph_Actual library
   if (!load_sizeceph_actual_library()) {
     *ss << "Failed to load SizeCeph_Actual library";
+    *ss << " (Default directory: " << g_ceph_context->_conf->erasure_code_dir << ")";
     return -ENOENT;
   }
   
@@ -251,11 +252,16 @@ bool ErasureCodeSizeCephActual::load_sizeceph_actual_library() {
     // Try alternative name in same directory
     sizeceph_actual_handle = dlopen("/home/joseph/code/sizeceph_actual/bin/sizecephactual.so", RTLD_LAZY);
     if (!sizeceph_actual_handle) {
-      // Try system path as fallback
-    sizeceph_actual_handle = dlopen("sizecephactual.so", RTLD_LAZY);
+      // Try erasure_code_dir path from config
+      const std::string filename_conf_based(g_ceph_context->_conf->erasure_code_dir + "/sizeceph/libsizeceph.so");
+      sizeceph_actual_handle = dlopen(filename_conf_based.c_str(), RTLD_LAZY);
       if (!sizeceph_actual_handle) {
-        dout(0) << "Failed to load SizeCeph_Actual library: " << dlerror() << dendl;
-        return false;
+        // Try system path as fallback
+        sizeceph_actual_handle = dlopen("sizecephactual.so", RTLD_LAZY);
+        if (!sizeceph_actual_handle) {
+          dout(0) << "Failed to load SizeCeph_Actual library: " << dlerror() << dendl;
+          return false;
+        }
       }
     }
   }
